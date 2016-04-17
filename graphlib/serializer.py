@@ -1,4 +1,5 @@
 from __future__ import unicode_literals, absolute_import
+from collections import deque
 from .graph import Node, Rel
 
 # Alias str to unicode with unicode_literals imported
@@ -16,10 +17,42 @@ class Serializer(object):
     See https://github.com/bruth/json-graph-spec for more information.
     """
     def __init__(self):
-        self.stack = []
+        self.queue = deque()
         self.indexes = {}
         self.items = []
+        self.batches = []
         self.index = 0
+
+        # 1 - node, 2 - rel
+        self._batch = None
+        self._batch_type = None
+
+    def _queue(self, item):
+        if item not in self.indexes and item not in self.queue:
+            if isinstance(item, Node):
+                self.queue.append(item)
+            elif isinstance(item, Rel):
+                self._queue(item.start)
+                self._queue(item.end)
+                self.queue.append(item)
+
+    def _batch_item(self, item, data):
+        item_type = 'type' in data and 2 or 1
+
+        # Append and reset the batch
+        if item_type != self._batch_type:
+            # Reset and append the reference
+            self._batch = []
+            self.batches.append(self._batch)
+            self._batch_type = item_type
+
+        self._batch.append(data)
+
+    def _add_item(self, item, data):
+        self.items.append(data)
+        self.indexes[item] = self.index
+        self.index += 1
+        self._batch_item(item, data)
 
     def _add_node(self, node):
         data = {'props': node.serialize()}
@@ -33,9 +66,7 @@ class Serializer(object):
         if node.update_props is not None:
             data['update'] = node.update_props
 
-        self.items.append(data)
-        self.indexes[node] = self.index
-        self.index += 1
+        self._add_item(node, data)
 
     def _add_rel(self, rel):
         data = {
@@ -51,32 +82,25 @@ class Serializer(object):
         if rel.update_props is not None:
             data['update'] = rel.update_props
 
-        self.items.append(data)
-        self.indexes[rel] = self.index
-        self.index += 1
+        self._add_item(rel, data)
 
     def _serialize_rel(self, rel):
-        if rel not in self.indexes:
-            if rel.start not in self.indexes:
-                self._add_node(rel.start)
-
-            if rel.end not in self.indexes:
-                self._add_node(rel.end)
-
-            self._add_rel(rel)
+        self._add_rel(rel)
 
     def _serialize_node(self, node, traverse):
-        if node not in self.indexes:
-            self._add_node(node)
+        # Add the node to the items
+        self._add_node(node)
 
         if traverse:
+            # Queue neighbors for traversal
+            for node in node.neighbors:
+                self._queue(node)
+
+            # Queue relationships to neighbors. The start and end
+            # nodes are guaranteed to be queued first, so there is
+            # not need to queue them here.
             for rel in node.rels():
-                if rel.start not in self.indexes:
-                    self.stack.append(rel.start)
-                if rel.end not in self.indexes:
-                    self.stack.append(rel.end)
-                if rel not in self.indexes:
-                    self.stack.append(rel)
+                self._queue(rel)
 
     def _serialize(self, item, traverse):
         if isinstance(item, Node):
@@ -87,15 +111,16 @@ class Serializer(object):
     def serialize(self, item, traverse=True):
         "Prepares a node or relationship for export."
         if isinstance(item, (Node, Rel)):
-            self.stack.append(item)
+            self._queue(item)
         elif isinstance(item, (tuple, list)):
-            self.stack.extend(item)
+            for _item in item:
+                self._queue(_item)
         else:
             raise TypeError('unable to prepare objects with type "{}"'
                             .format(type(item)))
 
-        while self.stack:
-            item = self.stack.pop()
+        while self.queue:
+            item = self.queue.popleft()
             self._serialize(item, traverse)
 
         return self.items
